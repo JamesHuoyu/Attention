@@ -1,0 +1,20 @@
+$ source /home/software/spack/share/spack/setup-env.sh
+$ spack load gcc@10.4.0 cmake@3.24.3%gcc@10.4.0 cuda@11.8.0%gcc@10.4.0 openmpi
+$ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(spack location -i cuda@11.8.0%gcc@10.4.0)/lib64
+
+$ make
+rm -rf opt benchmark.o opt.o
+nvcc -c  benchmark.cu -o benchmark.o
+nvcc -c  opt.cu -o opt.o
+nvcc -o opt benchmark.o opt.o  -L/home/software/spack/opt/spack/linux-rhel7-cascadelake/gcc-10.4.0/cuda-11.8.0-ltatyhkulwsdozesfrydkiexsohrz2cv -L/home/software/spack/opt/spack/linux-rhel7-cascadelake/gcc-10.4.0/cuda-11.8.0-ltatyhkulwsdozesfrydkiexsohrz2cv/stubs -lcuda -lcudart
+
+$ ... your srun here
+srun --nodes=1 --ntasks=1 --gpus=1 -c 48 --cpu-bind=cores ./opt
+[t2022011174@admin gpu]$ srun -N 1 -n 1 nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free --format=csv
+name, memory.total [MiB], memory.used [MiB], memory.free [MiB]
+NVIDIA A40, 46068 MiB, 0 MiB, 45466 MiB
+NVIDIA A40, 46068 MiB, 0 MiB, 45466 MiB
+[t2022011174@admin gpu]$ srun -N 1 -n 1 nvidia-smi --query-gpu=compute_cap --format=csv
+compute_cap
+8.6
+8.6
