@@ -13,7 +13,6 @@
         exit(EXIT_FAILURE); \
     } \
 }
-#define TILE 32
 
 const char* version_name = "Optimized implementation.";
 
@@ -108,97 +107,10 @@ const char* version_name = "Optimized implementation.";
 //     }
 // }
 
-
-__global__ void SgemmNaiveTransKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n){
-    __shared__ float smemA[TILE][TILE + 1];
-    __shared__ float smemB[TILE][TILE + 1];
-
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
-
-    const int blockRow = blockIdx.y * TILE;
-    const int blockCol = blockIdx.x * TILE;
-
-    const int threadRow = ty * 4;
-    const int threadCol = tx * 4;
-
-    for (int k = 0; k < n; k += TILE) {
-        float c_reg[4][4] = {{0}};
-        // 加载 A 的块到 smemA（行主序）
-        for (int load = 0; load < 4; load ++) {
-            const int arow = blockRow + threadRow + load;
-            const int acol = k + threadCol;
-
-            if (arow < n && acol < n) {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemA[threadRow + load][threadCol + i] = (acol + i < n) ? A[arow * n + (acol + i)] : 0.0f;
-                }
-            } else {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemA[threadRow + load][threadCol + i] = 0.0f;
-                }
-            }
-
-            // 加载 B 的块到 smemB (转置形式)
-            const int brow = k + threadRow + load;
-            const int bcol = blockCol + threadCol;
-
-            if (brow < n && bcol < n) {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemB[threadRow + load][threadCol + i] = (bcol + i < n) ? B[(bcol + i) * n + brow] : 0.0f;
-                }
-            } else {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemB[threadRow + load][threadCol + i] = 0.0f;
-                }
-            }
-        }
-        __syncthreads();
-
-        // 乘累加计算
-        for (int i = 0; i < TILE; i++) {
-            float a_reg[4], b_reg[4];
-            #pragma unroll
-            for (int x = 0; x < 4; x++) {
-                a_reg[x] = smemA[threadRow + x][i];
-            }
-            #pragma unroll
-            for (int y = 0; y < 4; y++) {
-                b_reg[y] = smemB[i][threadCol + y];
-            }
-            #pragma unroll
-            for (int x = 0; x < 4; x++) {
-                #pragma unroll
-                for (int y = 0; y < 4; y++) {
-                    c_reg[x][y] += a_reg[x] * b_reg[y];
-                }
-            }
-        }
-        __syncthreads();
-
-        // 写回结果（行主序）
-        const int write_row_start = blockRow + threadRow;
-        const int write_col_start = blockCol + threadCol;
-
-        for (int x = 0; x < 4; x++) {
-            const int write_row = write_row_start + x;
-            if (write_row >= n) break;
-            for (int y = 0; y < 4; y++) {
-                const int write_col = write_col_start + y;
-                if (write_col < n) {
-                    atomicAdd(&C[write_row * n + write_col], c_reg[x][y]);
-                }
-            }
-        }
-    }
-}
-__global__ void SgemmNaiveKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
-    __shared__ float smemA[TILE][TILE + 1];
-    __shared__ float smemB[TILE][TILE + 1];
+template <int TILE>
+__global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
+    __shared__ float4 smemA[TILE][TILE / 4 + 1];
+    __shared__ float4 smemB[TILE][TILE / 4 + 1];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -211,57 +123,61 @@ __global__ void SgemmNaiveKernel(float* __restrict__ A, float* __restrict__ B, f
 
     for (int k = 0; k < n; k += TILE) {
         float c_reg[4][4] = {{0}};
-        // 加载 A 的块到 smemA（行主序）
+        /*加载 A 的块到 smemA（行主序), 要进行转置才能使用 float4 连续加载到 reg中，需要保证arow 是 4的倍数，
+         方案是展开load，一次性读取4个load的值*/ 
+
         for (int load = 0; load < 4; load ++) {
             const int arow = blockRow + threadRow + load;
             const int acol = k + threadCol;
 
-            if (arow < n && acol < n) {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemA[threadRow + load][threadCol + i] = (acol + i < n) ? A[arow * n + (acol + i)] : 0.0f;
-                }
+            float4 tmp_vec_a = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (arow < n && acol + 3 < n){
+                tmp_vec_a = reinterpret_cast<float4*>(&A[arow * n + acol])[0];
             } else {
                 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemA[threadRow + load][threadCol + i] = 0.0f;
+                for (int i = 0; i < 4; i++){
+                    bool valid = (arow < n) && (acol + i < n);
+                    ((float*)&tmp_vec_a)[i] = valid ? A[arow * n + (acol + i)] : 0.0f;
                 }
             }
+            smemA[threadRow + load][threadCol] = tmp_vec_a;
 
             // 加载 B 的块到 smemB
             const int brow = k + threadRow + load;
-            const int bcol = blockCol + threadCol; // 使用 ty 而非 threadIdx.y
-
-            if (brow < n && bcol < n) {
-                #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemB[threadRow + load][threadCol + i] = (bcol + i < n) ? B[brow * n + (bcol + i)] : 0.0f;
-                }
+            const int bcol = blockCol + threadCol;
+            float4 tmp_vec_b = {0.0f, 0.0f, 0.0f, 0.0f};
+            if(brow < n && bcol + 3 < n){
+                tmp_vec_b = reinterpret_cast<float4*>(&B[brow * n + bcol])[0];
             } else {
                 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    smemB[threadRow + load][threadCol + i] = 0.0f;
+                for (int i = 0; i < 4; i++){
+                    bool valid = (brow < n) && (bcol + i < n);
+                    ((float *)&tmp_vec_b)[i] = valid ? B[brow * n + (bcol + i)] : 0.0f;
                 }
             }
+            smemB[threadRow + load][threadCol] = tmp_vec_b;
         }
         __syncthreads();
 
         // 乘累加计算
-        for (int i = 0; i < TILE; i++) {
-            float a_reg[4], b_reg[4];
+        for (int i_group = 0; i_group < TILE / 4; i_group++) {
+            float4 a_reg[4];
             #pragma unroll
-            for (int x = 0; x < 4; x++) {
-                a_reg[x] = smemA[threadRow + x][i];
+            for (int x = 0; x < 4; x++){
+                a_reg[x] = smemA[threadRow + x][i_group];
             }
+            float4 b_reg = smemB[i_group][threadCol / 4];
+
             #pragma unroll
-            for (int y = 0; y < 4; y++) {
-                b_reg[y] = smemB[i][threadCol + y];
-            }
-            #pragma unroll
-            for (int x = 0; x < 4; x++) {
+            for (int sub_i = 0; sub_i < 4; sub_i++) {
                 #pragma unroll
-                for (int y = 0; y < 4; y++) {
-                    c_reg[x][y] += a_reg[x] * b_reg[y];
+                for (int x = 0; x < 4; x++) {
+                    float a_val = ((float*)&a_reg[x])[sub_i];
+                    #pragma unroll
+                    for (int y = 0; y < 4; y++) {
+                        float b_val = ((float*)&b_reg)[y];
+                        c_reg[x][y] += a_val * b_val;
+                    }
                 }
             }
         }
@@ -283,6 +199,252 @@ __global__ void SgemmNaiveKernel(float* __restrict__ A, float* __restrict__ B, f
         }
     }
 }
+template <int TILE>
+__global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
+    __shared__ float4 smemA[TILE][TILE / 4 + 1];
+    __shared__ float4 smemB[TILE][TILE / 4 + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int blockRow = blockIdx.y * TILE;
+    const int blockCol = blockIdx.x * TILE;
+
+    const int threadRow = ty * 4;
+    const int threadCol = tx * 4;
+
+    for (int k = 0; k < n; k += TILE) {
+        float c_reg[4][4] = {{0}};
+        /*加载 A 的块到 smemA（行主序), 要进行转置才能使用 float4 连续加载到 reg中，需要保证arow 是 4的倍数，
+         方案是展开load，一次性读取4个load的值*/ 
+
+        for (int load = 0; load < 4; load ++) {
+            const int arow = blockRow + threadRow + load;
+            const int acol = k + threadCol;
+
+            float4 tmp_vec_a = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (arow < n && acol + 3 < n){
+                tmp_vec_a = reinterpret_cast<float4*>(&A[arow * n + acol])[0];
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 4; i++){
+                    bool valid = (arow < n) && (acol + i < n);
+                    ((float*)&tmp_vec_a)[i] = valid ? A[arow * n + (acol + i)] : 0.0f;
+                }
+            }
+            smemA[threadRow + load][threadCol] = tmp_vec_a;
+
+            // 加载 B 的块到 smemB
+            const int brow = k + threadRow + load;
+            const int bcol = blockCol + threadCol;
+            float4 tmp_vec_b = {0.0f, 0.0f, 0.0f, 0.0f};
+            if(brow < n && bcol + 3 < n){
+               #pragma unroll
+               for (int i = 0; i < 4; i++){
+                ((float*)&tmp_vec_b)[i] = B[(bcol + i) * n + brow];
+               }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 4; i++){
+                    bool valid = (brow < n) && (bcol + i < n);
+                    ((float *)&tmp_vec_b)[i] = valid ? B[brow * n + (bcol + i)] : 0.0f;
+                }
+            }
+            smemB[threadRow + load][threadCol] = tmp_vec_b;
+        }
+        __syncthreads();
+
+        // 乘累加计算
+        for (int i_group = 0; i_group < TILE / 4; i_group++) {
+            float4 a_reg[4];
+            #pragma unroll
+            for (int x = 0; x < 4; x++){
+                a_reg[x] = smemA[threadRow + x][i_group];
+            }
+            float4 b_reg = smemB[i_group][threadCol / 4];
+
+            #pragma unroll
+            for (int sub_i = 0; sub_i < 4; sub_i++) {
+                #pragma unroll
+                for (int x = 0; x < 4; x++) {
+                    float a_val = ((float*)&a_reg[x])[sub_i];
+                    #pragma unroll
+                    for (int y = 0; y < 4; y++) {
+                        float b_val = ((float*)&b_reg)[y];
+                        c_reg[x][y] += a_val * b_val;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // 写回结果（行主序）
+        const int write_row_start = blockRow + threadRow;
+        const int write_col_start = blockCol + threadCol;
+
+        for (int x = 0; x < 4; x++) {
+            const int write_row = write_row_start + x;
+            if (write_row >= n) break;
+            for (int y = 0; y < 4; y++) {
+                const int write_col = write_col_start + y;
+                if (write_col < n) {
+                    atomicAdd(&C[write_row * n + write_col], c_reg[x][y]);
+                }
+            }
+        }
+    }
+}
+// template <int TILE>
+// __global__ void SgemmDynamicTransKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n){
+//     __shared__ float smemA[TILE][TILE + 1];
+//     __shared__ float smemB[TILE][TILE + 1];
+
+//     const int tx = threadIdx.x;
+//     const int ty = threadIdx.y;
+
+//     const int blockRow = blockIdx.y * TILE;
+//     const int blockCol = blockIdx.x * TILE;
+
+//     const int threadRow = ty * 4;
+//     const int threadCol = tx * 4;
+
+//     for (int k = 0; k < n; k += TILE) {
+//         float c_reg[4][4] = {{0}};
+//         // 加载 A 的块到 smemA（行主序）
+//         for (int load = 0; load < 4; load ++) {
+//             const int arow = blockRow + threadRow + load;
+//             const int acol = k + threadCol;
+
+//             #pragma unroll
+//             for (int i = 0; i < 4; i++) {
+//                 bool valid = (arow < n) && (acol + i < n);
+//                 smemA[threadRow + load][threadCol + i] = valid ? A[arow * n + (acol + i)] : 0.0f;
+//             }
+
+//             // 加载 B 的块到 smemB (转置形式)
+//             const int brow = k + threadRow + load;
+//             const int bcol = blockCol + threadCol;
+
+//             #pragma unroll
+//             for (int i = 0; i < 4; i++) {
+//                 bool valid = (brow < n) && (bcol + i < n);
+//                 smemB[threadRow + load][threadCol + i] = valid ? B[(bcol + i) * n + brow] : 0.0f;
+//             }
+//         }
+//         __syncthreads();
+
+//         // 乘累加计算
+//         for (int i = 0; i < TILE; i++) {
+//             float a_reg[4], b_reg[4];
+//             #pragma unroll
+//             for (int x = 0; x < 4; x++) {
+//                 a_reg[x] = smemA[threadRow + x][i];
+//             }
+//             #pragma unroll
+//             for (int y = 0; y < 4; y++) {
+//                 b_reg[y] = smemB[i][threadCol + y];
+//             }
+//             #pragma unroll
+//             for (int x = 0; x < 4; x++) {
+//                 #pragma unroll
+//                 for (int y = 0; y < 4; y++) {
+//                     c_reg[x][y] += a_reg[x] * b_reg[y];
+//                 }
+//             }
+//         }
+//         __syncthreads();
+
+//         // 写回结果（行主序）
+//         const int write_row_start = blockRow + threadRow;
+//         const int write_col_start = blockCol + threadCol;
+
+//         for (int x = 0; x < 4; x++) {
+//             const int write_row = write_row_start + x;
+//             if (write_row >= n) break;
+//             for (int y = 0; y < 4; y++) {
+//                 const int write_col = write_col_start + y;
+//                 if (write_col < n) {
+//                     atomicAdd(&C[write_row * n + write_col], c_reg[x][y]);
+//                 }
+//             }
+//         }
+//     }
+// }
+// template <int TILE>
+// __global__ void SgemmDynamicKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
+//     __shared__ float smemA[TILE][TILE + 1];
+//     __shared__ float smemB[TILE][TILE + 1];
+
+//     const int tx = threadIdx.x;
+//     const int ty = threadIdx.y;
+
+//     const int blockRow = blockIdx.y * TILE;
+//     const int blockCol = blockIdx.x * TILE;
+
+//     const int threadRow = ty * 4;
+//     const int threadCol = tx * 4;
+
+//     for (int k = 0; k < n; k += TILE) {
+//         float c_reg[4][4] = {{0}};
+//         // 加载 A 的块到 smemA（行主序）
+//         for (int load = 0; load < 4; load ++) {
+//             const int arow = blockRow + threadRow + load;
+//             const int acol = k + threadCol;
+
+//             #pragma unroll
+//             for (int i = 0; i < 4; i++) {
+//                 bool valid = (arow < n) && (acol + i < n);
+//                 smemA[threadRow + load][threadCol + i] = valid ? A[arow * n + (acol + i)] : 0.0f;
+//             }
+
+//             // 加载 B 的块到 smemB
+//             const int brow = k + threadRow + load;
+//             const int bcol = blockCol + threadCol; // 使用 ty 而非 threadIdx.y
+//             #pragma unroll
+//             for (int i = 0; i < 4; i++) {
+//                 bool valid = (brow < n) && (bcol + i < n);
+//                 smemB[threadRow + load][threadCol + i] = valid ? B[brow * n + (bcol + i)] : 0.0f;
+//             }
+//         }
+//         __syncthreads();
+
+//         // 乘累加计算
+//         for (int i = 0; i < TILE; i++) {
+//             float a_reg[4], b_reg[4];
+//             #pragma unroll
+//             for (int x = 0; x < 4; x++) {
+//                 a_reg[x] = smemA[threadRow + x][i];
+//             }
+//             #pragma unroll
+//             for (int y = 0; y < 4; y++) {
+//                 b_reg[y] = smemB[i][threadCol + y];
+//             }
+//             #pragma unroll
+//             for (int x = 0; x < 4; x++) {
+//                 #pragma unroll
+//                 for (int y = 0; y < 4; y++) {
+//                     c_reg[x][y] += a_reg[x] * b_reg[y];
+//                 }
+//             }
+//         }
+//         __syncthreads();
+
+//         // 写回结果（行主序）
+//         const int write_row_start = blockRow + threadRow;
+//         const int write_col_start = blockCol + threadCol;
+
+//         for (int x = 0; x < 4; x++) {
+//             const int write_row = write_row_start + x;
+//             if (write_row >= n) break;
+//             for (int y = 0; y < 4; y++) {
+//                 const int write_col = write_col_start + y;
+//                 if (write_col < n) {
+//                     atomicAdd(&C[write_row * n + write_col], c_reg[x][y]);
+//                 }
+//             }
+//         }
+//     }
+// }
 __global__ void scale_kernel(float* matrix, int n, float scale){
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx < n * n){
@@ -400,17 +562,13 @@ __global__ void OnlineSoftmaxKernel(float* __restrict__ matrix, int n){
         matrix[row * n + j] = val / global_sum;
     }
 }
-void square_attention (int n, float* gpu_Q, float* gpu_K, float* gpu_V, float* gpu_Y){
 
-    float* gpu_QK_T;
-    size_t size = n * n * sizeof(float);
-
-    CHECK_CUDA(cudaMalloc((void**)&gpu_QK_T, size));
-
+template <int TILE>
+void launch_kernel(int n, float* gpu_Q, float* gpu_K, float* gpu_V, float* gpu_Y, float* gpu_QK_T){
     dim3 block_trans(TILE/4, TILE/4);
     dim3 grid_trans((n + TILE - 1) / TILE, (n + TILE - 1) / TILE);
-    size_t smem_trans = sizeof(float) * (TILE + 1) * TILE * 2;
-    SgemmNaiveTransKernel<<<grid_trans, block_trans, smem_trans>>>(gpu_Q, gpu_K, gpu_QK_T, n);
+    // size_t smem_trans = sizeof(float) * (TILE + 1) * TILE * 2;
+    SgemmVecTransKernel<TILE><<<grid_trans, block_trans>>>(gpu_Q, gpu_K, gpu_QK_T, n);
     CHECK_CUDA(cudaGetLastError());
 
     dim3 block_scale(256);
@@ -426,9 +584,22 @@ void square_attention (int n, float* gpu_Q, float* gpu_K, float* gpu_V, float* g
 
     dim3 block_mul(TILE/4, TILE/4);
     dim3 grid_mul((n + TILE - 1) / TILE, (n + TILE - 1) / TILE);
-    size_t smem_mul = sizeof(float) * (TILE + 1) * TILE * 2;
-    SgemmNaiveKernel<<<grid_mul, block_mul, smem_mul>>>(gpu_QK_T, gpu_V, gpu_Y, n);
+    // size_t smem_mul = sizeof(float) * (TILE + 1) * TILE * 2;
+    SgemmVecKernel<TILE><<<grid_mul, block_mul>>>(gpu_QK_T, gpu_V, gpu_Y, n);
     CHECK_CUDA(cudaGetLastError());
+}
 
+void square_attention (int n, float* gpu_Q, float* gpu_K, float* gpu_V, float* gpu_Y){
+
+    float* gpu_QK_T;
+    size_t size = n * n * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc((void**)&gpu_QK_T, size));
+
+    if (n <= 128) {
+        launch_kernel<32>(n, gpu_Q, gpu_K, gpu_V, gpu_Y, gpu_QK_T);
+    } else{
+        launch_kernel<64>(n, gpu_Q, gpu_K, gpu_V, gpu_Y, gpu_QK_T);
+    }
     CHECK_CUDA(cudaFree(gpu_QK_T));
 }
