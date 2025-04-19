@@ -109,7 +109,7 @@ const char* version_name = "Optimized implementation.";
 
 template <int TILE>
 __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
-    __shared__ float4 smemA[TILE / 4][TILE + 1];
+    __shared__ float4 smemA[TILE][TILE / 4 + 1];
     __shared__ float4 smemB[TILE][TILE / 4 + 1];
 
     const int tx = threadIdx.x;
@@ -118,15 +118,15 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
     const int blockRow = blockIdx.y * TILE;
     const int blockCol = blockIdx.x * TILE;
 
-    const int threadRow = ty * 4;
-    const int threadCol = tx * 4;
+    const int threadRow = ty * 2;
+    const int threadCol = tx * 8;
 
     float c_reg[4][4] = {{0}};
     for (int k = 0; k < n; k += TILE) {
         /*加载 A 的块到 smemA（行主序), 要进行转置才能使用 float4 连续加载到 reg中，需要保证arow 是 4的倍数
         A, B的封装是独立的，理论上最好的方法应该对A，B单独设计封装核*/ 
 
-        for (int load = 0; load < 4; load ++) {
+        for (int load = 0; load < 2; load ++) {
             const int arow = blockRow + threadRow + load;
             const int acol = k + threadCol;
 
@@ -141,7 +141,7 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
                     ((float*)&tmp_vec_a)[i] = valid ? A[index + i] : 0.0f;
                 }
             }
-            smemA[tx][threadRow + load] = tmp_vec_a;
+            smemA[threadRow + load][tx] = tmp_vec_a;
             // 加载 B 的块到 smemB
             const int brow = k + threadRow + load;
             const int bcol = blockCol + threadCol;
@@ -163,7 +163,7 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
         // 乘累加计算
         for (int i_group = 0; i_group < TILE / 4; i_group ++){
             float4 b_reg = smemB[i_group][tx];
-            float4 a_reg = smemA[i_group][threadRow];
+            float4 a_reg = smemA[i_group][ty];
             #pragma unroll
             for (int x = 0; x < 4; x++) {
                 float a_val = ((float*) & a_reg)[x];
@@ -194,8 +194,8 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
 }
 template <int TILE>
 __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
-    __shared__ float4 smemA[TILE / 4][TILE + 1];
-    __shared__ float4 smemB[TILE / 4][TILE + 1];
+    __shared__ float4 smemA[TILE][TILE / 4 + 1];
+    __shared__ float4 smemB[TILE][TILE / 4 + 1];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -203,8 +203,8 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
     const int blockRow = blockIdx.y * TILE;
     const int blockCol = blockIdx.x * TILE;
 
-    const int threadRow = ty * 4;
-    const int threadCol = tx * 4;
+    const int threadRow = ty * 2;
+    const int threadCol = tx * 8;
     
     float c_reg[4][4] = {{0}};
 
@@ -212,7 +212,7 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
         /*加载 A 的块到 smemA（行主序), 要进行转置才能使用 float4 连续加载到 reg中，需要保证arow 是 4的倍数，
          方案是展开load，一次性读取4个load的值*/ 
 
-        for (int load = 0; load < 4; load ++) {
+        for (int load = 0; load < 2; load ++) {
             const int arow = blockRow + threadRow + load;
             const int acol = k + threadCol;
 
@@ -227,7 +227,7 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
                     ((float*)&tmp_vec_a)[i] = valid ? A[index + i] : 0.0f;
                 }
             }
-            smemA[tx][threadRow + load] = tmp_vec_a;
+            smemA[threadRow + load][tx] = tmp_vec_a;
 
             // 加载 B 的块到 smemB
             const int brow = k + threadRow + load;
@@ -243,14 +243,14 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
                     ((float *)&tmp_vec_b)[i] = valid ? B[index_b + i] : 0.0f;
                 }
             }
-            smemB[tx][threadRow + load] = tmp_vec_b;
+            smemB[threadRow + load][tx] = tmp_vec_b;
         }
         __syncthreads();
 
         // 乘累加计算
         for (int i_group = 0; i_group < TILE / 4; i_group ++){
-            float4 b_reg = smemB[i_group][threadRow];
-            float4 a_reg = smemA[i_group][threadRow];
+            float4 b_reg = smemB[i_group][ty];
+            float4 a_reg = smemA[i_group][ty];
             #pragma unroll
             for (int x = 0; x < 4; x++) {
                 float a_val = ((float*) & a_reg)[x];
@@ -549,7 +549,7 @@ __global__ void OnlineSoftmaxKernel(float* __restrict__ matrix, int n){
 
 template <int TILE>
 void launch_kernel(int n, float* gpu_Q, float* gpu_K, float* gpu_V, float* gpu_Y, float* gpu_QK_T){
-    dim3 block_trans(TILE/4, TILE/4);
+    dim3 block_trans(TILE/8, TILE/2);
     dim3 grid_trans((n + TILE - 1) / TILE, (n + TILE - 1) / TILE);
     // size_t smem_trans = sizeof(float) * (TILE + 1) * TILE * 2;
     SgemmVecTransKernel<TILE><<<grid_trans, block_trans>>>(gpu_Q, gpu_K, gpu_QK_T, n);
@@ -566,7 +566,7 @@ void launch_kernel(int n, float* gpu_Q, float* gpu_K, float* gpu_V, float* gpu_Y
     OnlineSoftmaxKernel<<<grid_softmax, block_softmax, block_softmax.x / 32 * 2 * sizeof(float)>>>(gpu_QK_T, n);
     CHECK_CUDA(cudaGetLastError());
 
-    dim3 block_mul(TILE/4, TILE/4);
+    dim3 block_mul(TILE/8, TILE/2);
     dim3 grid_mul((n + TILE - 1) / TILE, (n + TILE - 1) / TILE);
     // size_t smem_mul = sizeof(float) * (TILE + 1) * TILE * 2;
     SgemmVecKernel<TILE><<<grid_mul, block_mul>>>(gpu_QK_T, gpu_V, gpu_Y, n);
