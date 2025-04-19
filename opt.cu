@@ -109,7 +109,7 @@ const char* version_name = "Optimized implementation.";
 
 template <int TILE>
 __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
-    __shared__ float4 smemA[TILE][TILE / 4 + 1];
+    __shared__ float4 smemA[TILE / 4][TILE + 1];
     __shared__ float4 smemB[TILE][TILE / 4 + 1];
 
     const int tx = threadIdx.x;
@@ -123,8 +123,8 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
 
     float c_reg[4][4] = {{0}};
     for (int k = 0; k < n; k += TILE) {
-        /*加载 A 的块到 smemA（行主序), 要进行转置才能使用 float4 连续加载到 reg中，需要保证arow 是 4的倍数，
-         方案是展开load，一次性读取4个load的值*/ 
+        /*加载 A 的块到 smemA（行主序), 要进行转置才能使用 float4 连续加载到 reg中，需要保证arow 是 4的倍数
+        A, B的封装是独立的，理论上最好的方法应该对A，B单独设计封装核*/ 
 
         for (int load = 0; load < 4; load ++) {
             const int arow = blockRow + threadRow + load;
@@ -141,8 +141,7 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
                     ((float*)&tmp_vec_a)[i] = valid ? A[index + i] : 0.0f;
                 }
             }
-            smemA[threadRow + load][threadCol] = tmp_vec_a;
-
+            smemA[tx][threadRow + load] = tmp_vec_a;
             // 加载 B 的块到 smemB
             const int brow = k + threadRow + load;
             const int bcol = blockCol + threadCol;
@@ -157,29 +156,21 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
                     ((float *)&tmp_vec_b)[i] = valid ? B[index_b + i] : 0.0f;
                 }
             }
-            smemB[threadRow + load][threadCol] = tmp_vec_b;
+            smemB[threadRow + load][tx] = tmp_vec_b;
         }
         __syncthreads();
 
         // 乘累加计算
-        for (int i_group = 0; i_group < TILE / 4; i_group++) {
-            float4 a_reg[4];
+        for (int i_group = 0; i_group < TILE / 4; i_group ++){
+            float4 b_reg = smemB[i_group][tx];
+            float4 a_reg = smemA[i_group][threadRow];
             #pragma unroll
-            for (int x = 0; x < 4; x++){
-                a_reg[x] = smemA[threadRow + x][i_group];
-            }
-            float4 b_reg = smemB[i_group][threadCol / 4];
-
-            #pragma unroll
-            for (int sub_i = 0; sub_i < 4; sub_i++) {
+            for (int x = 0; x < 4; x++) {
+                float a_val = ((float*) & a_reg)[x];
                 #pragma unroll
-                for (int x = 0; x < 4; x++) {
-                    float a_val = ((float*)&a_reg[x])[sub_i];
-                    #pragma unroll
-                    for (int y = 0; y < 4; y++) {
-                        float b_val = ((float*)&b_reg)[y];
-                        c_reg[x][y] += a_val * b_val;
-                    }
+                for (int y = 0; y < 4; y++) {
+                    float b_val = ((float*) & b_reg)[y];
+                    c_reg[x][y] += a_val * b_val;
                 }
             }
         }
@@ -203,7 +194,7 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
 }
 template <int TILE>
 __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
-    __shared__ float4 smemA[TILE][TILE / 4 + 1];
+    __shared__ float4 smemA[TILE / 4][TILE + 1];
     __shared__ float4 smemB[TILE][TILE / 4 + 1];
 
     const int tx = threadIdx.x;
@@ -236,7 +227,7 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
                     ((float*)&tmp_vec_a)[i] = valid ? A[index + i] : 0.0f;
                 }
             }
-            smemA[threadRow + load][threadCol] = tmp_vec_a;
+            smemA[tx][threadRow + load] = tmp_vec_a;
 
             // 加载 B 的块到 smemB
             const int brow = k + threadRow + load;
@@ -254,29 +245,21 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
                     ((float *)&tmp_vec_b)[i] = valid ? B[brow * n + (bcol + i)] : 0.0f;
                 }
             }
-            smemB[threadRow + load][threadCol] = tmp_vec_b;
+            smemB[threadRow + load][tx] = tmp_vec_b;
         }
         __syncthreads();
 
         // 乘累加计算
-        for (int i_group = 0; i_group < TILE / 4; i_group++) {
-            float4 a_reg[4];
+        for (int i_group = 0; i_group < TILE / 4; i_group ++){
+            float4 b_reg = smemB[i_group][tx];
+            float4 a_reg = smemA[i_group][threadRow];
             #pragma unroll
-            for (int x = 0; x < 4; x++){
-                a_reg[x] = smemA[threadRow + x][i_group];
-            }
-            float4 b_reg = smemB[i_group][threadCol / 4];
-
-            #pragma unroll
-            for (int sub_i = 0; sub_i < 4; sub_i++) {
+            for (int x = 0; x < 4; x++) {
+                float a_val = ((float*) & a_reg)[x];
                 #pragma unroll
-                for (int x = 0; x < 4; x++) {
-                    float a_val = ((float*)&a_reg[x])[sub_i];
-                    #pragma unroll
-                    for (int y = 0; y < 4; y++) {
-                        float b_val = ((float*)&b_reg)[y];
-                        c_reg[x][y] += a_val * b_val;
-                    }
+                for (int y = 0; y < 4; y++) {
+                    float b_val = ((float*) & b_reg)[y];
+                    c_reg[x][y] += a_val * b_val;
                 }
             }
         }
