@@ -195,7 +195,7 @@ __global__ void SgemmVecKernel(float* __restrict__ A, float* __restrict__ B, flo
 template <int TILE>
 __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B, float* __restrict__ C, int n) {
     __shared__ float4 smemA[TILE / 4][TILE + 1];
-    __shared__ float4 smemB[TILE][TILE / 4 + 1];
+    __shared__ float4 smemB[TILE / 4][TILE + 1];
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
@@ -233,25 +233,23 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
             const int brow = k + threadRow + load;
             const int bcol = blockCol + threadCol;
             float4 tmp_vec_b = {0.0f, 0.0f, 0.0f, 0.0f};
-            if(brow < n && bcol + 3 < n){
-               #pragma unroll
-               for (int i = 0; i < 4; i++){
-                ((float*)&tmp_vec_b)[i] = B[(bcol + i) * n + brow];
-               }
+            int index_b = brow * n + bcol;
+            if(index_b % 4 == 0 && brow < n && bcol + 3 < n){
+                tmp_vec_b = reinterpret_cast<float4*>(&B[index_b])[0];
             } else {
                 #pragma unroll
                 for (int i = 0; i < 4; i++){
                     bool valid = (brow < n) && (bcol + i < n);
-                    ((float *)&tmp_vec_b)[i] = valid ? B[brow * n + (bcol + i)] : 0.0f;
+                    ((float *)&tmp_vec_b)[i] = valid ? B[index_b + i] : 0.0f;
                 }
             }
-            smemB[threadRow + load][tx] = tmp_vec_b;
+            smemB[tx][threadRow + load] = tmp_vec_b;
         }
         __syncthreads();
 
         // 乘累加计算
         for (int i_group = 0; i_group < TILE / 4; i_group ++){
-            float4 b_reg = smemB[i_group][tx];
+            float4 b_reg = smemB[i_group][threadRow];
             float4 a_reg = smemA[i_group][threadRow];
             #pragma unroll
             for (int x = 0; x < 4; x++) {
@@ -275,7 +273,7 @@ __global__ void SgemmVecTransKernel(float* __restrict__ A, float* __restrict__ B
         for (int y = 0; y < 4; y++) {
             const int write_col = write_col_start + y;
             if (write_col < n) {
-                atomicAdd(&C[write_row * n + write_col], c_reg[x][y]);
+                C[write_row * n + write_col] = c_reg[x][y];
             }
         }
     }
