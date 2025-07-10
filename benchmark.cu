@@ -126,7 +126,7 @@ int main(int argc, char const *argv[])
 		// printf("total_err: %.8lf\n", total_err);
 		if (total_err > 100*n*FLT_EPSILON*n){
 			printf("total_err: %.8lf\n", total_err);
-			// die("*** FAILURE *** Error in calculation exceeds componentwise error bounds.\n" );
+			die("*** FAILURE *** Error in calculation exceeds componentwise error bounds.\n" );
 		}
 	}
 	cudaFree(gpu_Q);
